@@ -1953,3 +1953,113 @@ class FusedAttention(torch.nn.Module):
             return output[0].view(*output[0].shape[:-2], -1), output[1]
         # ...hd -> ...(hd)
         return output.view(*output.shape[:-2], -1)
+
+
+class _FA3TreeAttnFunc(torch.autograd.Function):
+    """Autograd wrapper for the FA3 tree attention kernel.
+
+    Forward calls ``flash_attn_interface.flash_attn_tree_func``; backward
+    calls ``flash_attn_tree_bwd_func``. Tree topology
+    (``cu_node_lens`` / ``node_parent``) and the output of
+    ``precompute_tree_metadata`` are saved into the autograd context so
+    both the forward and backward legs see a consistent view of the trie.
+    """
+
+    @staticmethod
+    def forward(ctx, q, k, v, cu_node_lens, node_parent, softmax_scale, precomputed):
+        from flash_attn_interface import flash_attn_tree_func
+
+        out, lse = flash_attn_tree_func(
+            q, k, v, cu_node_lens, node_parent,
+            softmax_scale=softmax_scale,
+            tree_metadata=precomputed,
+        )
+        ctx.save_for_backward(q, k, v, out, lse, cu_node_lens, node_parent)
+        ctx.softmax_scale = softmax_scale
+        ctx.precomputed = precomputed
+        return out
+
+    @staticmethod
+    def backward(ctx, dout):
+        from flash_attn_interface import flash_attn_tree_bwd_func
+
+        q, k, v, out, lse, cu_node_lens, node_parent = ctx.saved_tensors
+        dq, dk, dv = flash_attn_tree_bwd_func(
+            dout, q, k, v, out, lse,
+            cu_node_lens, node_parent,
+            softmax_scale=ctx.softmax_scale,
+            tree_metadata=ctx.precomputed,
+        )
+        return dq, dk, dv, None, None, None, None
+
+
+class TreeFlashAttention(torch.nn.Module):
+    """Tree-attention backend for packed THD sequences whose tokens form a trie.
+
+    Routes through the FA3 tree attention kernel from
+    ``flash_attn_interface``, which shares the common prefix of N sibling
+    sequences across attention. Requires a Hopper-class GPU and the FA3
+    wheel.
+
+    Inputs:
+      * ``query / key / value``: ``[B, S, H, D]`` with ``B == 1`` for the
+        tree path.
+      * ``cu_node_lens``: ``int32`` ``[num_nodes + 1]`` cumulative per-node
+        token count.
+      * ``node_parent``: ``int32`` ``[num_nodes]`` parent index per node
+        (``-1`` for roots).
+      * ``precomputed``: opaque ``dict`` from
+        ``flash_attn_interface.precompute_tree_metadata`` — reused across
+        all transformer layers in a forward / backward pass.
+
+    ``cp_size`` must be 1; CP-aware tree attention is tracked as a
+    follow-up. Intentionally does not implement ``get_attention_backend``
+    dispatch — ``TreeFlashAttention`` is wired directly by consumers
+    (e.g. Megatron's ``TETreeDotProductAttention``) that already know they
+    want the tree path. Future work can extend ``get_attention_backend``
+    with a ``use_tree_attention`` branch driven by a new
+    ``AttentionParams`` field.
+
+    Env switch: ``NVTE_TREE_ATTN=0`` disables this backend for callers that
+    respect it (kill-switch for debugging).
+    """
+
+    def __init__(
+        self,
+        softmax_scale: float,
+        attention_type: str = "self",
+        layer_number: int | None = None,
+    ) -> None:
+        super().__init__()
+        if attention_type != "self":
+            raise ValueError("TreeFlashAttention only supports self-attention.")
+        self.softmax_scale = softmax_scale
+        self.attention_type = attention_type
+        self.layer_number = 1 if layer_number is None else layer_number
+
+    def forward(
+        self,
+        query_layer: torch.Tensor,
+        key_layer: torch.Tensor,
+        value_layer: torch.Tensor,
+        cu_node_lens: torch.Tensor,
+        node_parent: torch.Tensor,
+        precomputed,
+    ) -> torch.Tensor:
+        """Forward.
+
+        Inputs ``[S, B, H, D]`` (Megatron convention). Output
+        ``[S, B, H * D]`` to match the rest of the TE attention stack.
+        """
+        # [S, B, H, D] -> [B, S, H, D]; B == 1 for tree training so this
+        # permute is a no-copy reshape.
+        q = query_layer.permute(1, 0, 2, 3).contiguous()
+        k = key_layer.permute(1, 0, 2, 3).contiguous()
+        v = value_layer.permute(1, 0, 2, 3).contiguous()
+
+        out = _FA3TreeAttnFunc.apply(
+            q, k, v, cu_node_lens, node_parent, self.softmax_scale, precomputed,
+        )
+
+        s, b = query_layer.shape[0], query_layer.shape[1]
+        return out.permute(1, 0, 2, 3).contiguous().view(s, b, -1)
