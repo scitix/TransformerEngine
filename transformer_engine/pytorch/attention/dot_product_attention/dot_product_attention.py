@@ -831,9 +831,7 @@ class DotProductAttention(TransformerEngineBaseModule):
         pad_between_seqs: Optional[bool] = None,
         fp8_output: Optional[bool] = False,
         num_splits: Optional[int] = 1,
-        tree_cu_node_lens: Optional[torch.Tensor] = None,
-        tree_node_parent: Optional[torch.Tensor] = None,
-        tree_precomputed: Optional[Dict[str, Any]] = None,
+        tree_metadata: Optional[Any] = None,
     ) -> torch.Tensor:
         r"""
         Dot Product Attention Layer.
@@ -1355,11 +1353,7 @@ class DotProductAttention(TransformerEngineBaseModule):
                 return_max_logit=self.return_max_logit,
                 cuda_graph=is_graph_capturing(),
                 num_splits=num_splits,
-                tree_attention=(
-                    tree_cu_node_lens is not None
-                    and tree_node_parent is not None
-                    and tree_precomputed is not None
-                ),
+                tree_attention=tree_metadata is not None,
             )
             global _attention_backends
             if is_in_onnx_export_mode():
@@ -1442,9 +1436,9 @@ class DotProductAttention(TransformerEngineBaseModule):
                     query_layer,
                     key_layer,
                     value_layer,
-                    cu_node_lens=tree_cu_node_lens,
-                    node_parent=tree_node_parent,
-                    precomputed=tree_precomputed,
+                    cu_node_lens=tree_metadata.cu_node_lens,
+                    node_parent=tree_metadata.node_parent,
+                    precomputed=tree_metadata.precomputed,
                 )
 
             if use_flash_attention:
