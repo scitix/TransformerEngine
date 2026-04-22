@@ -2048,18 +2048,33 @@ class TreeFlashAttention(torch.nn.Module):
     ) -> torch.Tensor:
         """Forward.
 
-        Inputs ``[S, B, H, D]`` (Megatron convention). Output
-        ``[S, B, H * D]`` to match the rest of the TE attention stack.
+        Accepts either SBHD ``[S, B, H, D]`` (Megatron convention) or
+        THD ``[T, H, D]`` (Megatron packed-sequence convention where
+        the batch dim has been squeezed). Output shape matches input
+        convention: ``[S, B, H*D]`` for SBHD, ``[T, H*D]`` for THD.
         """
-        # [S, B, H, D] -> [B, S, H, D]; B == 1 for tree training so this
-        # permute is a no-copy reshape.
-        q = query_layer.permute(1, 0, 2, 3).contiguous()
-        k = key_layer.permute(1, 0, 2, 3).contiguous()
-        v = value_layer.permute(1, 0, 2, 3).contiguous()
+        # Normalize to [B, T, H, D] for FA3
+        if query_layer.dim() == 3:
+            # THD [T, H, D] -> [1, T, H, D]
+            _thd_input = True
+            q = query_layer.unsqueeze(0).contiguous()
+            k = key_layer.unsqueeze(0).contiguous()
+            v = value_layer.unsqueeze(0).contiguous()
+        else:
+            # SBHD [S, B, H, D] -> [B, S, H, D]
+            _thd_input = False
+            q = query_layer.permute(1, 0, 2, 3).contiguous()
+            k = key_layer.permute(1, 0, 2, 3).contiguous()
+            v = value_layer.permute(1, 0, 2, 3).contiguous()
 
         out = _FA3TreeAttnFunc.apply(
             q, k, v, cu_node_lens, node_parent, self.softmax_scale, precomputed,
         )
 
-        s, b = query_layer.shape[0], query_layer.shape[1]
-        return out.permute(1, 0, 2, 3).contiguous().view(s, b, -1)
+        if _thd_input:
+            # [1, T, H, D] -> [T, H*D]
+            return out.squeeze(0).reshape(query_layer.shape[0], -1)
+        else:
+            # [B, S, H, D] -> [S, B, H*D]
+            s, b = query_layer.shape[0], query_layer.shape[1]
+            return out.permute(1, 0, 2, 3).contiguous().view(s, b, -1)
