@@ -266,6 +266,11 @@ class AttentionParams:
     return_max_logit: bool = False
     cuda_graph: bool = False
     num_splits: int = 1
+    # Tree-attention dispatch flag. When True, get_attention_backend short-
+    # circuits to the TreeFlashAttention backend; the caller must also pass
+    # tree_cu_node_lens / tree_node_parent / tree_precomputed to
+    # DotProductAttention.forward at call time.
+    tree_attention: bool = False
 
     def __eq__(self, other):
         """
@@ -342,12 +347,50 @@ def get_attention_backend(
     return_max_logit = attention_params.return_max_logit
     cuda_graph = attention_params.cuda_graph
     num_splits = attention_params.num_splits
+    tree_attention = attention_params.tree_attention
 
     # Run config
     logger = logging.getLogger("DotProductAttention")
     logger.setLevel(AttentionLogging._log_level)
     if not logger.hasHandlers():
         logger.addHandler(AttentionLogging._stream_handler)
+
+    # Tree-attention early dispatch: when the caller advertises tree mode we
+    # bypass the normal Flash/Fused/Unfused selection and route directly to
+    # TreeFlashAttention. Tree requires `thd` layout, no CP (Stage 2+), and
+    # FA3 to be installed; the TreeFlashAttention backend itself rechecks
+    # runtime-specific preconditions (FA3 wheel importability, etc).
+    if tree_attention:
+        tree_kill_switch = int(os.getenv("NVTE_TREE_ATTN", "1")) == 0
+        if tree_kill_switch:
+            logger.debug("NVTE_TREE_ATTN=0; tree_attention disabled")
+            return (
+                False, None,
+                False, None,
+                False,
+                [False, False, False],
+                False,
+            )
+        if not qkv_layout.startswith("thd"):
+            raise ValueError(
+                f"tree_attention requires qkv_layout starting with 'thd' "
+                f"(got '{qkv_layout}')"
+            )
+        if context_parallel:
+            raise ValueError(
+                "tree_attention does not yet support context parallelism. "
+                "CP-aware tree attention is tracked as Stage 2+ of the "
+                "tree-training migration plan."
+            )
+        logger.debug("Selected backend = TreeFlashAttention")
+        return (
+            False, None,
+            False, None,
+            False,
+            [False, False, False],
+            True,
+        )
+
     device_compute_capability = get_device_compute_capability()
     cudnn_version = get_cudnn_version()
     run_config = {
@@ -1166,6 +1209,7 @@ def get_attention_backend(
         fused_attention_backend,
         use_unfused_attention,
         available_backends,
+        False,  # use_tree_attention — tree path uses the early return above
     )
 
 

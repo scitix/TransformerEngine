@@ -59,6 +59,7 @@ from transformer_engine.pytorch.attention.dot_product_attention.backends import 
     UnfusedDotProductAttention,
     FusedAttention,
     FlashAttention,
+    TreeFlashAttention,
 )
 
 
@@ -73,6 +74,7 @@ _attention_backends = {
     "use_fused_attention": None,
     "fused_attention_backend": None,
     "use_unfused_attention": None,
+    "use_tree_attention": None,
     "backend_selection_requires_update": False,
 }
 
@@ -470,6 +472,15 @@ class DotProductAttention(TransformerEngineBaseModule):
             return_max_logit=self.return_max_logit,
         )
 
+        # Tree-attention backend. Lightweight module that holds the softmax
+        # scale; the FA3 wheel is imported lazily inside its forward, so
+        # non-tree deployments pay zero import cost.
+        self.tree_attention = TreeFlashAttention(
+            softmax_scale,
+            attention_type=attention_type,
+            layer_number=layer_number,
+        )
+
         def remove_extra_states_check(self, incompatible_keys):  # pylint: disable=unused-argument
             """
             Temporarily remove core_attention._extra_state as a missing key
@@ -820,6 +831,7 @@ class DotProductAttention(TransformerEngineBaseModule):
         pad_between_seqs: Optional[bool] = None,
         fp8_output: Optional[bool] = False,
         num_splits: Optional[int] = 1,
+        tree_metadata: Optional[Any] = None,
     ) -> torch.Tensor:
         r"""
         Dot Product Attention Layer.
@@ -1341,6 +1353,7 @@ class DotProductAttention(TransformerEngineBaseModule):
                 return_max_logit=self.return_max_logit,
                 cuda_graph=is_graph_capturing(),
                 num_splits=num_splits,
+                tree_attention=tree_metadata is not None,
             )
             global _attention_backends
             if is_in_onnx_export_mode():
@@ -1349,6 +1362,7 @@ class DotProductAttention(TransformerEngineBaseModule):
                 use_flash_attention = False
                 use_fused_attention = False
                 use_unfused_attention = True
+                use_tree_attention = False
             else:
                 if (
                     _attention_backends["attention_params"] is None
@@ -1364,6 +1378,7 @@ class DotProductAttention(TransformerEngineBaseModule):
                         fused_attention_backend,
                         use_unfused_attention,
                         _,
+                        use_tree_attention,
                     ) = dpa_utils.get_attention_backend(attention_params)
                     # Set global _attention_backends var using return value
                     # from get_attention_backend()
@@ -1372,8 +1387,11 @@ class DotProductAttention(TransformerEngineBaseModule):
                     _attention_backends["use_fused_attention"] = use_fused_attention
                     _attention_backends["fused_attention_backend"] = fused_attention_backend
                     _attention_backends["use_unfused_attention"] = use_unfused_attention
+                    _attention_backends["use_tree_attention"] = use_tree_attention
                     _attention_backends["backend_selection_requires_update"] = False
-                    if use_flash_attention:
+                    if use_tree_attention:
+                        self.logger.info("Running with TreeFlashAttention backend")
+                    elif use_flash_attention:
                         self.logger.info(
                             "Running with FlashAttention backend (version %s)",
                             flash_attention_backend,
@@ -1391,9 +1409,15 @@ class DotProductAttention(TransformerEngineBaseModule):
                     use_fused_attention = _attention_backends["use_fused_attention"]
                     fused_attention_backend = _attention_backends["fused_attention_backend"]
                     use_unfused_attention = _attention_backends["use_unfused_attention"]
+                    use_tree_attention = _attention_backends["use_tree_attention"]
 
             # raise exception if no backend is available
-            if sum([use_flash_attention, use_fused_attention, use_unfused_attention]) == 0:
+            if sum([
+                use_flash_attention,
+                use_fused_attention,
+                use_unfused_attention,
+                bool(use_tree_attention),
+            ]) == 0:
                 raise ValueError(
                     "No dot product attention backend is available for the provided inputs. Please"
                     " run with NVTE_DEBUG=1 NVTE_DEBUG_LEVEL=2 to find out the reasons for"
@@ -1406,6 +1430,16 @@ class DotProductAttention(TransformerEngineBaseModule):
                 if self.softmax_offset is not None
                 else None
             )
+
+            if use_tree_attention:
+                return self.tree_attention(
+                    query_layer,
+                    key_layer,
+                    value_layer,
+                    cu_node_lens=tree_metadata.cu_node_lens,
+                    node_parent=tree_metadata.node_parent,
+                    precomputed=tree_metadata.precomputed,
+                )
 
             if use_flash_attention:
                 if core_attention_bias_type == "alibi":
